@@ -1,0 +1,29 @@
+# Build outputs
+bin/
+*.exe
+
+# Local tools and virtualenvs
+.tools/
+.venv/
+
+# Downloaded models and large artifacts
+models/
+*.safetensors
+*.pt
+*.bin
+*.onnx
+
+# Caches
+.cache/
+**/.cache/
+__pycache__/
+*.pyc
+
+# Editor/OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Misc chat/agent artifacts
+.aider*
+*.history.md
