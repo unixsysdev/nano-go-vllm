@@ -28,8 +28,11 @@ type Config struct {
 	HiddenAct               string  `json:"hidden_act"`
 	MaxPositionEmbeddings   int     `json:"max_position_embeddings"`
 	RMSNormEps              float64 `json:"rms_norm_eps"`
-	HeadDim                 int     `json:"head_dim"`
-	EOSTokenID              int     `json:"eos_token_id"`
+    HeadDim                 int     `json:"head_dim"`
+    EOSTokenID              int     `json:"eos_token_id"`
+    RoPETheta               float64 `json:"rope_theta"`
+    RopeScalingType         string  `json:"-"`
+    RopeScalingFactor       float64 `json:"-"`
 }
 
 // LoadConfig loads configuration from model path
@@ -57,11 +60,11 @@ func LoadConfig(modelPath string, opts ...Option) (*Config, error) {
 
 	// Load model-specific config
 	modelConfigPath := filepath.Join(cfg.ModelPath, "config.json")
-	if data, err := os.ReadFile(modelConfigPath); err == nil {
-		var modelConfig map[string]interface{}
-		if err := json.Unmarshal(data, &modelConfig); err != nil {
-			return nil, err
-		}
+    if data, err := os.ReadFile(modelConfigPath); err == nil {
+        var modelConfig map[string]interface{}
+        if err := json.Unmarshal(data, &modelConfig); err != nil {
+            return nil, err
+        }
 		
 		// Extract relevant fields
 		if v, ok := modelConfig["vocab_size"].(float64); ok {
@@ -93,12 +96,21 @@ func LoadConfig(modelPath string, opts ...Option) (*Config, error) {
 		if v, ok := modelConfig["rms_norm_eps"].(float64); ok {
 			cfg.RMSNormEps = v
 		}
-		if v, ok := modelConfig["head_dim"].(float64); ok {
-			cfg.HeadDim = int(v)
-		} else {
-			cfg.HeadDim = cfg.HiddenSize / cfg.NumAttentionHeads
-		}
-	}
+        if v, ok := modelConfig["head_dim"].(float64); ok {
+            cfg.HeadDim = int(v)
+        } else {
+            cfg.HeadDim = cfg.HiddenSize / cfg.NumAttentionHeads
+        }
+        if v, ok := modelConfig["rope_theta"].(float64); ok {
+            cfg.RoPETheta = v
+        } else {
+            cfg.RoPETheta = 10000.0
+        }
+        if rs, ok := modelConfig["rope_scaling"].(map[string]interface{}); ok {
+            if t, ok := rs["type"].(string); ok { cfg.RopeScalingType = t }
+            if f, ok := rs["factor"].(float64); ok { cfg.RopeScalingFactor = f }
+        }
+    }
 
     // If NumKVCacheBlocks not provided, derive a conservative default
     if cfg.NumKVCacheBlocks <= 0 {

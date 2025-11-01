@@ -30,6 +30,9 @@ type Sequence struct {
     IgnoreEOS          bool
     TopP               float32
     TopK               int
+    RepetitionPenalty  float32
+    PresencePenalty    float32
+    FrequencyPenalty   float32
 }
 
 var sequenceCounter int64
@@ -50,6 +53,9 @@ func NewSequence(tokenIDs []int, params *sampling.SamplingParams) *Sequence {
         IgnoreEOS:       params.IgnoreEOS,
         TopP:            params.TopP,
         TopK:            params.TopK,
+        RepetitionPenalty: params.RepetitionPenalty,
+        PresencePenalty:   params.PresencePenalty,
+        FrequencyPenalty:  params.FrequencyPenalty,
     }
 	
 	// Copy token IDs

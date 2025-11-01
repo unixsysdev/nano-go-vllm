@@ -8,7 +8,7 @@ import (
 
 // Embedding represents an embedding layer
 type Embedding struct {
-	weight *tensor.Tensor
+    weight *tensor.Tensor
 }
 
 // NewEmbedding creates a new embedding layer
@@ -98,4 +98,10 @@ func (e *Embedding) LoadWeights(weightData []float32) error {
     // copy provided weights into underlying buffer
     copy(weightDense.Data().([]float32), weightData)
     return nil
+}
+
+// RawWeight exposes the underlying weight buffer (read-only by convention).
+func (e *Embedding) RawWeight() []float32 {
+    if e == nil || e.weight == nil { return nil }
+    return e.weight.Data().Data().([]float32)
 }

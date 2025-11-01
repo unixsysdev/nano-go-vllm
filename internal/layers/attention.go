@@ -4,6 +4,7 @@ import (
     "fmt"
     "math"
 
+    "github.com/unixsysdev/nano-go-vllm/internal/mathx"
     "github.com/unixsysdev/nano-go-vllm/internal/tensor"
 )
 
@@ -32,7 +33,7 @@ func (a *Attention) SetVWeights(w []float32) error { return a.vProj.LoadWeights(
 func (a *Attention) SetOWeights(w []float32) error { return a.oProj.LoadWeights(w, nil) }
 
 // NewAttention creates a new attention layer
-func NewAttention(hiddenSize, numHeads, numKVHeads, headDim int, maxPosition int) (*Attention, error) {
+func NewAttention(hiddenSize, numHeads, numKVHeads, headDim int, maxPosition int, ropeTheta float64) (*Attention, error) {
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
 
 	qProj, err := NewLinear(hiddenSize, numHeads*headDim, false)
@@ -55,7 +56,7 @@ func NewAttention(hiddenSize, numHeads, numKVHeads, headDim int, maxPosition int
 		return nil, fmt.Errorf("failed to create o projection: %v", err)
 	}
 
-	rotaryEmbed, err := NewRotaryEmbedding(headDim, headDim, maxPosition, 10000.0)
+    rotaryEmbed, err := NewRotaryEmbedding(headDim, headDim, maxPosition, ropeTheta)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create rotary embedding: %v", err)
 	}
@@ -107,12 +108,11 @@ func (a *Attention) Forward(input, positions *tensor.Tensor) (*tensor.Tensor, er
     vData := v.Data().Data().([]float32) // [T, numKVHeads*headDim]
 
     headsOut := make([]float32, T*a.numHeads*a.headDim)
-
+    // Append K,V for this block
+    prev := a.cacheLen
     for t := 0; t < T; t++ {
-        p := a.cacheLen + t
+        p := prev + t
         if p >= a.rotaryEmbed.maxPosition { p = a.rotaryEmbed.maxPosition - 1 }
-
-        // Append K,V to caches per kv-head
         for kv := 0; kv < a.numKVHeads; kv++ {
             kOff := t*a.numKVHeads*a.headDim + kv*a.headDim
             vOff := t*a.numKVHeads*a.headDim + kv*a.headDim
@@ -125,46 +125,47 @@ func (a *Attention) Forward(input, positions *tensor.Tensor) (*tensor.Tensor, er
             a.vCache[kv] = append(a.vCache[kv], vVec...)
         }
         a.cacheLen++
-
-        // compute per attention head output
-        for h := 0; h < a.numHeads; h++ {
-            kv := h % a.numKVHeads
+    }
+    L := a.cacheLen
+    for h := 0; h < a.numHeads; h++ {
+        kv := h % a.numKVHeads
+        // Build Q_h (T x D) with RoPE applied
+        qh := make([]float32, T*a.headDim)
+        for t := 0; t < T; t++ {
+            p := prev + t
+            if p >= a.rotaryEmbed.maxPosition { p = a.rotaryEmbed.maxPosition - 1 }
             qOff := t*a.numHeads*a.headDim + h*a.headDim
-            qVec := make([]float32, a.headDim)
-            copy(qVec, qData[qOff:qOff+a.headDim])
-            a.rotaryEmbed.applyRotary(qVec, p)
-
-            L := a.cacheLen
-            scores := make([]float32, L)
-            kCache := a.kCache[kv]
-            for i := 0; i < L; i++ {
-                kc := kCache[i*a.headDim : (i+1)*a.headDim]
-                // dot in float32
-                var s float32
-                for d := 0; d < a.headDim; d++ { s += qVec[d] * kc[d] }
-                scores[i] = s * a.scale
-            }
-            // softmax
-            max := scores[0]
-            for i := 1; i < L; i++ { if scores[i] > max { max = scores[i] } }
+            vec := make([]float32, a.headDim)
+            copy(vec, qData[qOff:qOff+a.headDim])
+            a.rotaryEmbed.applyRotary(vec, p)
+            copy(qh[t*a.headDim:(t+1)*a.headDim], vec)
+        }
+        // K_h cache [L x D] and V_h cache [L x D]
+        kh := a.kCache[kv]
+        vh := a.vCache[kv]
+        // scores = qh * kh^T -> [T x L]
+        scores := make([]float32, T*L)
+        mathx.GemmNT(a.scale, qh, T, a.headDim, kh, L, a.headDim, 0.0, scores)
+        // causal softmax row-wise
+        for t := 0; t < T; t++ {
+            allowed := prev + t + 1
+            if allowed > L { allowed = L }
+            row := scores[t*L : (t+1)*L]
+            for i := allowed; i < L; i++ { row[i] = -1e30 }
+            max := row[0]
+            for i := 1; i < L; i++ { if row[i] > max { max = row[i] } }
             var sum float32
-            for i := 0; i < L; i++ {
-                scores[i] = float32(math.Exp(float64(scores[i]-max)))
-                sum += scores[i]
-            }
+            for i := 0; i < L; i++ { row[i] = float32(math.Exp(float64(row[i]-max))); sum += row[i] }
             if sum == 0 { sum = 1 }
-            for i := 0; i < L; i++ { scores[i] /= sum }
-
-            // weighted sum of V
-            vCache := a.vCache[kv]
-            outHead := make([]float32, a.headDim)
-            for i := 0; i < L; i++ {
-                w := scores[i]
-                vc := vCache[i*a.headDim : (i+1)*a.headDim]
-                for d := 0; d < a.headDim; d++ { outHead[d] += w * vc[d] }
-            }
+            inv := 1 / sum
+            for i := 0; i < L; i++ { row[i] *= inv }
+        }
+        // out_h = scores * vh -> [T x D]
+        outH := make([]float32, T*a.headDim)
+        mathx.GemmNN(1.0, scores, T, L, vh, L, a.headDim, 0.0, outH)
+        for t := 0; t < T; t++ {
             outOff := t*a.numHeads*a.headDim + h*a.headDim
-            copy(headsOut[outOff:outOff+a.headDim], outHead)
+            copy(headsOut[outOff:outOff+a.headDim], outH[t*a.headDim:(t+1)*a.headDim])
         }
     }
 

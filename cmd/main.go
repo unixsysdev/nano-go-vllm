@@ -9,6 +9,7 @@ import (
     "github.com/unixsysdev/nano-go-vllm/internal/config"
     "github.com/unixsysdev/nano-go-vllm/internal/engine"
     "github.com/unixsysdev/nano-go-vllm/internal/sampling"
+    "github.com/unixsysdev/nano-go-vllm/pkg/tokenizer"
 )
 
 func main() {
@@ -17,6 +18,10 @@ func main() {
     temperature := fs.Float64("temperature", 0.7, "sampling temperature")
     topP := fs.Float64("top-p", 0.95, "nucleus sampling probability mass (0-1)")
     topK := fs.Int("top-k", 50, "top-k sampling (0 = disabled)")
+    repPenalty := fs.Float64("repetition-penalty", 1.1, "repetition penalty (>1 to penalize repeats)")
+    presencePenalty := fs.Float64("presence-penalty", 0.0, "presence penalty (penalize seen tokens)")
+    frequencyPenalty := fs.Float64("frequency-penalty", 0.0, "frequency penalty (per occurrence)")
+    stream := fs.Bool("stream", false, "stream tokens as they are generated")
     _ = fs.Parse(os.Args[1:])
 
     args := fs.Args()
@@ -49,16 +54,37 @@ func main() {
         IgnoreEOS:   false,
         TopP:        float32(*topP),
         TopK:        *topK,
+        RepetitionPenalty: float32(*repPenalty),
+        PresencePenalty:   float32(*presencePenalty),
+        FrequencyPenalty:  float32(*frequencyPenalty),
     }
 
-	// Generate text
-	outputs, err := llmEngine.Generate([]string{prompt}, []*sampling.SamplingParams{params})
-	if err != nil {
-		log.Fatalf("Generation failed: %v", err)
-	}
-
-	// Print output
-	fmt.Printf("Prompt: %s\n", prompt)
-    fmt.Printf("Output: %s\n", outputs[0].Text)
-    fmt.Printf("Token IDs: %v\n", outputs[0].TokenIDs)
+    tok, _ := tokenizer.NewTokenizer(modelPath)
+    if *stream {
+        // streaming: add request then step
+        if err := llmEngine.AddRequest(prompt, params); err != nil { log.Fatalf("add request: %v", err) }
+        fmt.Printf("Prompt: %s\n", prompt)
+        fmt.Print("Output: ")
+        var outTokens []int
+        for !llmEngine.IsFinished() {
+            stepOut, err := llmEngine.Step()
+            if err != nil { log.Fatalf("step failed: %v", err) }
+            for _, so := range stepOut {
+                // print only new tokens (so.TokenIDs is completion set)
+                if len(so.TokenIDs) > len(outTokens) {
+                    new := so.TokenIDs[len(outTokens):]
+                    outTokens = append(outTokens, new...)
+                    if s, err := tok.Decode(new); err == nil { fmt.Print(s) }
+                }
+            }
+        }
+        fmt.Printf("\nToken IDs: %v\n", outTokens)
+    } else {
+        // Generate text (non-streaming)
+        outputs, err := llmEngine.Generate([]string{prompt}, []*sampling.SamplingParams{params})
+        if err != nil { log.Fatalf("Generation failed: %v", err) }
+        fmt.Printf("Prompt: %s\n", prompt)
+        fmt.Printf("Output: %s\n", outputs[0].Text)
+        fmt.Printf("Token IDs: %v\n", outputs[0].TokenIDs)
+    }
 }

@@ -1,9 +1,11 @@
 package tokenizer
 
 import (
+    "bytes"
     "encoding/json"
     "fmt"
     "os"
+    "os/exec"
     "path/filepath"
     "regexp"
     "sort"
@@ -29,6 +31,9 @@ type bpeTokenizer struct {
 
     byteEncoder map[byte]rune
     byteDecoder map[rune]byte
+
+    added       map[string]int
+    addedSorted []string
 }
 
 // NewTokenizer loads a HF-like tokenizer.json with model.type == "BPE" and optional ByteLevel pre_tokenizer
@@ -49,6 +54,11 @@ func NewTokenizer(modelPath string) (Tokenizer, error) {
             Type string `json:"type"`
             AddPrefixSpace bool `json:"add_prefix_space"`
         } `json:"pre_tokenizer"`
+        AddedTokens []struct {
+            ID int `json:"id"`
+            Content string `json:"content"`
+            Special bool `json:"special"`
+        } `json:"added_tokens"`
     }
     if err := json.Unmarshal(data, &cfg); err != nil {
         return nil, fmt.Errorf("parse tokenizer.json: %w", err)
@@ -65,11 +75,14 @@ func NewTokenizer(modelPath string) (Tokenizer, error) {
         ranks[[2]string{parts[0], parts[1]}] = i
     }
 
-    // Build idToToken slice for decode
+    // Build idToToken slice including added tokens
+    vocab := make(map[string]int, len(cfg.Model.Vocab)+len(cfg.AddedTokens))
+    for k, v := range cfg.Model.Vocab { vocab[k] = v }
+    for _, a := range cfg.AddedTokens { vocab[a.Content] = a.ID }
     maxID := -1
-    for _, id := range cfg.Model.Vocab { if id > maxID { maxID = id } }
+    for _, id := range vocab { if id > maxID { maxID = id } }
     idToTok := make([]string, maxID+1)
-    for tok, id := range cfg.Model.Vocab { if id >= 0 && id < len(idToTok) { idToTok[id] = tok } }
+    for tok, id := range vocab { if id >= 0 && id < len(idToTok) { idToTok[id] = tok } }
 
     // Unk & EOS
     unkID := -1
@@ -86,9 +99,16 @@ func NewTokenizer(modelPath string) (Tokenizer, error) {
         }
     }
 
+    // Added tokens sorted by length desc for greedy longest match
+    added := make(map[string]int)
+    for _, a := range cfg.AddedTokens { added[a.Content] = a.ID }
+    var addedSorted []string
+    for s := range added { addedSorted = append(addedSorted, s) }
+    sort.Slice(addedSorted, func(i,j int) bool { return len(addedSorted[i]) > len(addedSorted[j]) })
+
     bt, bd := bytesToUnicode()
     return &bpeTokenizer{
-        vocab: cfg.Model.Vocab,
+        vocab: vocab,
         idToToken: idToTok,
         mergesRank: ranks,
         addPrefixSpace: cfg.PreTokenizer.Type == "ByteLevel" && cfg.PreTokenizer.AddPrefixSpace,
@@ -96,29 +116,50 @@ func NewTokenizer(modelPath string) (Tokenizer, error) {
         unkID: unkID,
         byteEncoder: bt,
         byteDecoder: bd,
+        added: added,
+        addedSorted: addedSorted,
     }, nil
 }
 
 // Encode runs a simplified ByteLevel pretokenization + BPE
 func (t *bpeTokenizer) Encode(text string) ([]int, error) {
-    // Basic whitespace split; add prefix space to each token except first if configured
-    // In ByteLevel, spaces are significant; we approximate by splitting on spaces but keeping them by prefix space.
-    // For better fidelity, a regex is often used; we'll split on runs of whitespace.
-    re := regexp.MustCompile(`\S+|\s+`)
-    parts := re.FindAllString(text, -1)
     var ids []int
-    for i, p := range parts {
-        if strings.TrimSpace(p) == "" {
-            // Whitespace chunk - merge with next word as prefix space if applicable
-            continue
+    if t.addPrefixSpace && (len(text) > 0 && text[0] != ' ') {
+        text = " " + text
+    }
+    pos := 0
+    for pos < len(text) {
+        // Try greedy match of added special tokens
+        matched := false
+        for _, tok := range t.addedSorted {
+            if strings.HasPrefix(text[pos:], tok) {
+                ids = append(ids, t.added[tok])
+                pos += len(tok)
+                matched = true
+                break
+            }
         }
-        token := p
-        if t.addPrefixSpace && i > 0 {
-            token = " " + token
+        if matched { continue }
+        // Find next special token occurrence to bound a normal chunk
+        next := len(text)
+        for _, tok := range t.addedSorted {
+            if i := strings.Index(text[pos:], tok); i >= 0 {
+                if pos+i < next { next = pos+i }
+            }
         }
-        for _, id := range t.encodeWord(token) {
-            ids = append(ids, id)
+        chunk := text[pos:next]
+        // Whitespace-aware split
+        re := regexp.MustCompile(`\S+|\s+`)
+        parts := re.FindAllString(chunk, -1)
+        for i, p := range parts {
+            if strings.TrimSpace(p) == "" { continue }
+            tok := p
+            if t.addPrefixSpace && !(pos==0 && i==0) {
+                tok = " " + tok
+            }
+            ids = append(ids, t.encodeWord(tok)...)
         }
+        pos = next
     }
     return ids, nil
 }
@@ -169,6 +210,62 @@ func (t *bpeTokenizer) Decode(tokenIDs []int) (string, error) {
 }
 
 func (t *bpeTokenizer) GetEOS() int { return t.eosID }
+
+// External tokenizer uses Python tokenizers library via scripts/tokenizer_adapter.py
+type external struct { modelPath string; py string; script string; eos int }
+
+func pickPython() (string, error) {
+    // Try venv python first
+    cand := []string{".venv/bin/python", ".venv/bin/python3", "python3", "python"}
+    for _, p := range cand {
+        if _, err := os.Stat(p); err == nil { return p, nil }
+        if exe, err := exec.LookPath(p); err == nil { return exe, nil }
+    }
+    return "", fmt.Errorf("python not found")
+}
+
+func newExternal(modelPath string) (*external, error) {
+    py, err := pickPython()
+    if err != nil { return nil, err }
+    script := filepath.Join("scripts", "tokenizer_adapter.py")
+    if _, err := os.Stat(script); err != nil { return nil, err }
+    // Try to read eos from config.json
+    eos := -1
+    if data, err := os.ReadFile(filepath.Join(modelPath, "config.json")); err == nil {
+        var cfg map[string]interface{}
+        if json.Unmarshal(data, &cfg) == nil {
+            if v, ok := cfg["eos_token_id"].(float64); ok { eos = int(v) }
+        }
+    }
+    return &external{modelPath: modelPath, py: py, script: script, eos: eos}, nil
+}
+
+func (e *external) Encode(text string) ([]int, error) {
+    cmd := exec.Command(e.py, e.script, "encode", e.modelPath, text)
+    var out bytes.Buffer
+    cmd.Stdout = &out
+    cmd.Stderr = &out
+    if err := cmd.Run(); err != nil { return nil, fmt.Errorf("encode failed: %v: %s", err, out.String()) }
+    var resp struct{ Ids []int `json:"ids"`; Error string `json:"error"` }
+    if err := json.Unmarshal(out.Bytes(), &resp); err != nil { return nil, err }
+    if resp.Error != "" { return nil, fmt.Errorf(resp.Error) }
+    return resp.Ids, nil
+}
+
+func (e *external) Decode(tokenIDs []int) (string, error) {
+    b, _ := json.Marshal(tokenIDs)
+    cmd := exec.Command(e.py, e.script, "decode", e.modelPath, string(b))
+    var out bytes.Buffer
+    cmd.Stdout = &out
+    cmd.Stderr = &out
+    if err := cmd.Run(); err != nil { return "", fmt.Errorf("decode failed: %v: %s", err, out.String()) }
+    var resp struct{ Text string `json:"text"`; Error string `json:"error"` }
+    if err := json.Unmarshal(out.Bytes(), &resp); err != nil { return "", err }
+    if resp.Error != "" { return "", fmt.Errorf(resp.Error) }
+    return resp.Text, nil
+}
+
+func (e *external) GetEOS() int { return e.eos }
 
 // bpeMerge performs BPE merges on slice of symbols using rank map
 func bpeMerge(sym []string, ranks map[[2]string]int) []string {

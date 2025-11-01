@@ -16,6 +16,9 @@ type SamplingParams struct {
     IgnoreEOS   bool
     TopP        float32
     TopK        int
+    RepetitionPenalty float32
+    PresencePenalty   float32
+    FrequencyPenalty  float32
 }
 
 // Sampler represents a token sampler
@@ -27,7 +30,7 @@ func NewSampler() *Sampler {
 }
 
 // Sample samples tokens from logits
-func (s *Sampler) Sample(logits *tensor.Tensor, temperatures []float32) ([]int, error) {
+func (s *Sampler) Sample(logits *tensor.Tensor, temperatures []float32, prevTokens [][]int, params []*SamplingParams) ([]int, error) {
     shape := logits.Shape()
     if len(shape) != 2 {
         return nil, fmt.Errorf("logits must be 2D tensor")
@@ -51,15 +54,30 @@ func (s *Sampler) Sample(logits *tensor.Tensor, temperatures []float32) ([]int, 
                 logitSlice[j] /= temp
             }
         }
+        // Penalties / filters configured per sample
+        p := DefaultParams
+        if params != nil && i < len(params) && params[i] != nil {
+            p.TopP = params[i].TopP
+            p.TopK = params[i].TopK
+            p.RepetitionPenalty = params[i].RepetitionPenalty
+            p.PresencePenalty = params[i].PresencePenalty
+            p.FrequencyPenalty = params[i].FrequencyPenalty
+        }
+
+        // Apply repetition / presence / frequency penalties on logits
+        if prevTokens != nil && i < len(prevTokens) {
+            applyPenalties(logitSlice, prevTokens[i], p)
+        }
+
         // Top-k filter
-        if DefaultParams.TopK > 0 {
-            topKFilter(logitSlice, DefaultParams.TopK)
+        if p.TopK > 0 {
+            topKFilter(logitSlice, p.TopK)
         }
         // Softmax -> probs
         probs := softmax(logitSlice)
         // Top-p filter (nucleus)
-        if DefaultParams.TopP > 0 && DefaultParams.TopP < 1 {
-            probs = topPFilter(probs, DefaultParams.TopP)
+        if p.TopP > 0 && p.TopP < 1 {
+            probs = topPFilter(probs, p.TopP)
         }
         // Sample token
         tokens[i] = sampleFromProbs(probs)
@@ -72,7 +90,10 @@ func (s *Sampler) Sample(logits *tensor.Tensor, temperatures []float32) ([]int, 
 var DefaultParams = struct{
     TopP float32
     TopK int
-}{TopP: 0.95, TopK: 50}
+    RepetitionPenalty float32
+    PresencePenalty   float32
+    FrequencyPenalty  float32
+}{TopP: 0.95, TopK: 50, RepetitionPenalty: 1.0, PresencePenalty: 0.0, FrequencyPenalty: 0.0}
 
 func topKFilter(logits []float32, k int) {
     if k <= 0 || k >= len(logits) { return }
@@ -110,6 +131,32 @@ func topPFilter(probs []float32, p float32) []float32 {
         for i := range probs { probs[i] *= inv }
     }
     return probs
+}
+
+func applyPenalties(logits []float32, prev []int, cfg struct{TopP float32; TopK int; RepetitionPenalty, PresencePenalty, FrequencyPenalty float32}) {
+    if len(prev) == 0 { return }
+    // Count frequencies
+    counts := make(map[int]int)
+    for _, id := range prev { counts[id]++ }
+    for id, c := range counts {
+        if id < 0 || id >= len(logits) { continue }
+        // repetition penalty: divide or multiply logits
+        if cfg.RepetitionPenalty != 0 && cfg.RepetitionPenalty != 1.0 {
+            if logits[id] > 0 {
+                logits[id] /= cfg.RepetitionPenalty
+            } else {
+                logits[id] *= cfg.RepetitionPenalty
+            }
+        }
+        // presence penalty shifts logits down if token present
+        if cfg.PresencePenalty != 0 {
+            logits[id] -= cfg.PresencePenalty
+        }
+        // frequency penalty scales by count
+        if cfg.FrequencyPenalty != 0 {
+            logits[id] -= cfg.FrequencyPenalty * float32(c)
+        }
+    }
 }
 
 // softmax computes softmax probabilities
