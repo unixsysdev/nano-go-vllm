@@ -34,10 +34,17 @@ type bpeTokenizer struct {
 
     added       map[string]int
     addedSorted []string
+
+    pattern *regexp.Regexp
+    bpeCache map[string][]string
 }
 
 // NewTokenizer loads a HF-like tokenizer.json with model.type == "BPE" and optional ByteLevel pre_tokenizer
 func NewTokenizer(modelPath string) (Tokenizer, error) {
+    // Prefer external HF tokenizer if available for immediate parity
+    if ext, err := newExternal(modelPath); err == nil {
+        return ext, nil
+    }
     tokPath := filepath.Join(modelPath, "tokenizer.json")
     data, err := os.ReadFile(tokPath)
     if err != nil {
@@ -47,7 +54,7 @@ func NewTokenizer(modelPath string) (Tokenizer, error) {
         Model struct {
             Type  string            `json:"type"`
             Vocab map[string]int    `json:"vocab"`
-            Merges []string         `json:"merges"`
+            MergesRaw []interface{} `json:"merges"`
             UnkToken string         `json:"unk_token"`
         } `json:"model"`
         PreTokenizer struct {
@@ -68,8 +75,21 @@ func NewTokenizer(modelPath string) (Tokenizer, error) {
     }
 
     // Build ranks
-    ranks := make(map[[2]string]int, len(cfg.Model.Merges))
-    for i, m := range cfg.Model.Merges {
+    var merges []string
+    for _, it := range cfg.Model.MergesRaw {
+        switch v := it.(type) {
+        case string:
+            merges = append(merges, v)
+        case []interface{}:
+            if len(v) == 2 {
+                a, _ := v[0].(string)
+                b, _ := v[1].(string)
+                if a != "" && b != "" { merges = append(merges, a+" "+b) }
+            }
+        }
+    }
+    ranks := make(map[[2]string]int, len(merges))
+    for i, m := range merges {
         parts := strings.Split(m, " ")
         if len(parts) != 2 { continue }
         ranks[[2]string{parts[0], parts[1]}] = i
@@ -107,6 +127,8 @@ func NewTokenizer(modelPath string) (Tokenizer, error) {
     sort.Slice(addedSorted, func(i,j int) bool { return len(addedSorted[i]) > len(addedSorted[j]) })
 
     bt, bd := bytesToUnicode()
+    // GPT-2 ByteLevel pretokenizer regex
+    pat := regexp.MustCompile(`(?i)'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+`)
     return &bpeTokenizer{
         vocab: vocab,
         idToToken: idToTok,
@@ -118,6 +140,8 @@ func NewTokenizer(modelPath string) (Tokenizer, error) {
         byteDecoder: bd,
         added: added,
         addedSorted: addedSorted,
+        pattern: pat,
+        bpeCache: make(map[string][]string),
     }, nil
 }
 
@@ -129,7 +153,7 @@ func (t *bpeTokenizer) Encode(text string) ([]int, error) {
     }
     pos := 0
     for pos < len(text) {
-        // Try greedy match of added special tokens
+        // Greedy special tokens
         matched := false
         for _, tok := range t.addedSorted {
             if strings.HasPrefix(text[pos:], tok) {
@@ -140,24 +164,18 @@ func (t *bpeTokenizer) Encode(text string) ([]int, error) {
             }
         }
         if matched { continue }
-        // Find next special token occurrence to bound a normal chunk
+        // Bound by next special occurrence
         next := len(text)
         for _, tok := range t.addedSorted {
             if i := strings.Index(text[pos:], tok); i >= 0 {
                 if pos+i < next { next = pos+i }
             }
         }
-        chunk := text[pos:next]
-        // Whitespace-aware split
-        re := regexp.MustCompile(`\S+|\s+`)
-        parts := re.FindAllString(chunk, -1)
-        for i, p := range parts {
-            if strings.TrimSpace(p) == "" { continue }
-            tok := p
-            if t.addPrefixSpace && !(pos==0 && i==0) {
-                tok = " " + tok
-            }
-            ids = append(ids, t.encodeWord(tok)...)
+        segment := text[pos:next]
+        toks := t.pattern.FindAllString(segment, -1)
+        for _, tk := range toks {
+            if tk == "" { continue }
+            ids = append(ids, t.encodeWord(tk)...)
         }
         pos = next
     }
@@ -165,28 +183,18 @@ func (t *bpeTokenizer) Encode(text string) ([]int, error) {
 }
 
 func (t *bpeTokenizer) encodeWord(word string) []int {
-    // Map to byte-level unicode
-    var bytes []byte
-    bytes = []byte(word)
-    // map bytes -> unicode runes
-    chars := make([]string, 0, len(bytes))
-    for _, b := range bytes {
-        r := t.byteEncoder[b]
-        chars = append(chars, string(r))
+    // ByteLevel bytes->unicode mapping
+    raw := []byte(word)
+    var sb strings.Builder
+    sb.Grow(len(raw))
+    for _, b := range raw { sb.WriteRune(t.byteEncoder[b]) }
+    token := sb.String()
+    if v, ok := t.bpeCache[token]; ok {
+        return t.tokensToIDs(v)
     }
-
-    // BPE merge
-    tokens := bpeMerge(chars, t.mergesRank)
-    // Map to ids
-    out := make([]int, 0, len(tokens))
-    for _, tok := range tokens {
-        if id, ok := t.vocab[tok]; ok {
-            out = append(out, id)
-        } else if t.unkID >= 0 {
-            out = append(out, t.unkID)
-        }
-    }
-    return out
+    pieces := t.applyBPE(token)
+    t.bpeCache[token] = pieces
+    return t.tokensToIDs(pieces)
 }
 
 // Decode maps token ids back to text (approximate for ByteLevel)
@@ -210,6 +218,72 @@ func (t *bpeTokenizer) Decode(tokenIDs []int) (string, error) {
 }
 
 func (t *bpeTokenizer) GetEOS() int { return t.eosID }
+
+// --- BPE internals ---
+func (t *bpeTokenizer) applyBPE(token string) []string {
+    if token == "" { return nil }
+    // split into runes (as strings)
+    symbols := make([]string, 0, len(token))
+    for _, r := range token { symbols = append(symbols, string(r)) }
+    if len(symbols) == 1 { return symbols }
+    pairs := getPairs(symbols)
+    for {
+        if len(pairs) == 0 { break }
+        var best [2]string
+        bestRank := int(^uint(0) >> 1)
+        found := false
+        for p := range pairs {
+            if r, ok := t.mergesRank[p]; ok {
+                if r < bestRank { bestRank = r; best = p; found = true }
+            }
+        }
+        if !found { break }
+        // merge occurrences
+        merged := make([]string, 0, len(symbols))
+        i := 0
+        for i < len(symbols) {
+            j := indexPair(symbols, i, best)
+            if j == -1 {
+                merged = append(merged, symbols[i:]...)
+                break
+            }
+            merged = append(merged, symbols[i:j]...)
+            merged = append(merged, symbols[j]+symbols[j+1])
+            i = j + 2
+        }
+        symbols = merged
+        if len(symbols) == 1 { break }
+        pairs = getPairs(symbols)
+    }
+    return symbols
+}
+
+func getPairs(symbols []string) map[[2]string]struct{} {
+    pairs := make(map[[2]string]struct{})
+    for i := 0; i < len(symbols)-1; i++ {
+        pairs[[2]string{symbols[i], symbols[i+1]}] = struct{}{}
+    }
+    return pairs
+}
+
+func indexPair(symbols []string, start int, pair [2]string) int {
+    for i := start; i < len(symbols)-1; i++ {
+        if symbols[i] == pair[0] && symbols[i+1] == pair[1] { return i }
+    }
+    return -1
+}
+
+func (t *bpeTokenizer) tokensToIDs(tokens []string) []int {
+    out := make([]int, 0, len(tokens))
+    for _, tok := range tokens {
+        if id, ok := t.vocab[tok]; ok {
+            out = append(out, id)
+        } else if t.unkID >= 0 {
+            out = append(out, t.unkID)
+        }
+    }
+    return out
+}
 
 // External tokenizer uses Python tokenizers library via scripts/tokenizer_adapter.py
 type external struct { modelPath string; py string; script string; eos int }

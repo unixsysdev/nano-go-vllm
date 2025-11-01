@@ -13,7 +13,7 @@ import (
 // LLMEngine represents the LLM inference engine
 type LLMEngine struct {
 	config      *config.Config
-	model       *models.Qwen3Model
+    model       *models.QwenModel
 	tokenizer   tokenizer.Tokenizer
 	scheduler   *Scheduler
 	modelRunner *ModelRunner
@@ -35,7 +35,7 @@ func NewLLMEngine(modelPath string, opts ...config.Option) (*LLMEngine, error) {
 	}
 
 	// Initialize model
-	model, err := models.NewQwen3Model(cfg)
+    model, err := models.NewQwenModel(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create model: %v", err)
 	}

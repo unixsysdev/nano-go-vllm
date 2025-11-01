@@ -23,15 +23,24 @@ Build:
 go build -o bin/nanovllm cmd/main.go
 ```
 
-Download a small Qwen model (example: Qwen2.5‑0.5B‑Instruct):
+Download a model (script)
+
+Use the helper to fetch a small public model. Examples:
 
 ```bash
-python3 -m venv .venv
-./.venv/bin/pip install -q --upgrade pip huggingface_hub
-./.venv/bin/hf download Qwen/Qwen2.5-0.5B-Instruct \
-  --include "*.json" --include "*.safetensors" \
-  --local-dir models/qwen2_5_0_5b
+# Qwen3 0.6B (base)
+scripts/download_model.sh qwen3-0.6b models/qwen3_0_6b
+
+# Qwen2.5 0.5B Instruct
+scripts/download_model.sh qwen2.5-0.5b-instruct models/qwen2_5_0_5b
+
+# Or any HF repo id you have access to:
+scripts/download_model.sh Qwen/Qwen2.5-0.5B-Instruct models/qwen2_5_0_5b
 ```
+
+Notes:
+- Public models work without auth. For gated/private repos, set `HF_TOKEN`.
+- The script prefers the `hf` CLI if present, else uses a local venv with `huggingface_hub`.
 
 Run a short generation (CPU):
 
@@ -47,7 +56,13 @@ Flags:
 - `-top-k` (default 50)
  - `-repetition-penalty` (default 1.1)
  - `-presence-penalty`, `-frequency-penalty`
- - `-stream` (stream tokens as they are generated)
+- `-stream` (stream tokens as they are generated)
+
+Verification / Debugging
+
+- `-verify` prints the top logits for the last token (no sampling). Useful to check parity with a reference implementation.
+  Example: `./bin/nanovllm -verify models/qwen3_0_6b "Hello"`
+
 
 Tips:
 - Use proper chat formatting for instruct models, e.g.:

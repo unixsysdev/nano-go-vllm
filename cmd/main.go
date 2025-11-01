@@ -66,7 +66,7 @@ func main() {
         // Build model directly and print last-token top logits
         cfg, err := config.LoadConfig(modelPath)
         if err != nil { log.Fatalf("config: %v", err) }
-        mdl, err := models.NewQwen3Model(cfg)
+        mdl, err := models.NewQwenModel(cfg)
         if err != nil { log.Fatalf("model: %v", err) }
         ids, err := tok.Encode(prompt)
         if err != nil { log.Fatalf("encode: %v", err) }

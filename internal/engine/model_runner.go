@@ -14,12 +14,12 @@ import (
 // ModelRunner runs the model inference
 type ModelRunner struct {
     config  *config.Config
-    model   *models.Qwen3Model
+    model   *models.QwenModel
     sampler *sampling.Sampler
 }
 
 // NewModelRunner creates a new model runner
-func NewModelRunner(cfg *config.Config, model *models.Qwen3Model) (*ModelRunner, error) {
+func NewModelRunner(cfg *config.Config, model *models.QwenModel) (*ModelRunner, error) {
 	return &ModelRunner{
 		config:  cfg,
 		model:   model,
