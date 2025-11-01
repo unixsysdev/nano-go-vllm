@@ -14,13 +14,12 @@ This is a learning/reference implementation — correctness first, then speed. I
 ## Quickstart
 
 Prereqs:
-- Go 1.22+ (repo includes a local toolchain under `.tools/go` if needed)
+- Go 1.22+
 - Python venv to download a model with `huggingface_hub`
 
 Build:
 
 ```bash
-export PATH="$PWD/.tools/go/bin:$PATH"   # optional: use local Go
 go build -o bin/nanovllm cmd/main.go
 ```
 
@@ -46,6 +45,9 @@ Flags:
 - `-temperature` (default 0.7)
 - `-top-p` (default 0.95)
 - `-top-k` (default 50)
+ - `-repetition-penalty` (default 1.1)
+ - `-presence-penalty`, `-frequency-penalty`
+ - `-stream` (stream tokens as they are generated)
 
 Tips:
 - Use proper chat formatting for instruct models, e.g.:
@@ -65,20 +67,22 @@ Tips:
 - `internal/engine`: basic scheduler, runner, and sampling glue
 - `cmd/main.go`: CLI with sampling flags
 
-## Limitations
+## Status
 
-- CPU only, single sequence at a time; slow for >0.5B models
-- Minimal KV cache; no paged cache or tensor parallel
-- Math kernels are naive loops; BLAS/vectorization would speed things up
+- CPU only. Minimal per‑layer KV cache.
+- Streaming output (`-stream`) supported.
+- Sampling: Top‑k / Top‑p, repetition / presence / frequency penalties.
+- Tokenizer + weights: ByteLevel BPE tokenizer and safetensors loader (F32/F16/BF16).
+- Vectorized math: Attention core uses BLAS‑backed GEMM (Q·Kᵀ and probs·V); linear layers ride BLAS via gorgonia tensor.
+- RoPE: rope_theta read from `config.json` and applied.
 
 ## Roadmap
 
-- BLAS/AVX vectorized matmul and attention kernels
-- Streaming token output
-- Repetition penalty, frequency/presence penalties
-- Batched generation
+- Repro‑checked RoPE: implement rope_scaling variants and verify numerical parity with HF for Qwen.
+- Batched generation with shared kernels (multi‑seq forward with shared GEMM calls).
+- Typical sampling / min_p and deterministic seeding.
+- Parity tests: 1‑token logits checks against transformers; micro‑benchmarks for kernels.
 
 ## License
 
 MIT
-
