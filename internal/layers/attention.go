@@ -127,8 +127,11 @@ func (a *Attention) Forward(input, positions *tensor.Tensor) (*tensor.Tensor, er
         a.cacheLen++
     }
     L := a.cacheLen
+    // Group-Query Attention mapping: groupSize = numHeads / numKVHeads
+    groupSize := a.numHeads / a.numKVHeads
+    if groupSize == 0 { groupSize = 1 }
     for h := 0; h < a.numHeads; h++ {
-        kv := h % a.numKVHeads
+        kv := h / groupSize
         // Build Q_h (T x D) with RoPE applied
         qh := make([]float32, T*a.headDim)
         for t := 0; t < T; t++ {
