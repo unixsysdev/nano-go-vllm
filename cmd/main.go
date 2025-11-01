@@ -5,11 +5,14 @@ import (
     "fmt"
     "log"
     "os"
+    "sort"
 
     "github.com/unixsysdev/nano-go-vllm/internal/config"
     "github.com/unixsysdev/nano-go-vllm/internal/engine"
+    "github.com/unixsysdev/nano-go-vllm/internal/models"
     "github.com/unixsysdev/nano-go-vllm/internal/sampling"
     "github.com/unixsysdev/nano-go-vllm/pkg/tokenizer"
+    "github.com/unixsysdev/nano-go-vllm/internal/tensor"
 )
 
 func main() {
@@ -22,6 +25,7 @@ func main() {
     presencePenalty := fs.Float64("presence-penalty", 0.0, "presence penalty (penalize seen tokens)")
     frequencyPenalty := fs.Float64("frequency-penalty", 0.0, "frequency penalty (per occurrence)")
     stream := fs.Bool("stream", false, "stream tokens as they are generated")
+    verify := fs.Bool("verify", false, "print top logits for the last token (no sampling)")
     _ = fs.Parse(os.Args[1:])
 
     args := fs.Args()
@@ -37,15 +41,13 @@ func main() {
         prompt = args[1]
     }
 
-	// Initialize engine
-	llmEngine, err := engine.NewLLMEngine(
-		modelPath,
-		config.WithEnforceEager(true),
-		config.WithTensorParallelSize(1),
-	)
-	if err != nil {
-		log.Fatalf("Failed to initialize LLM engine: %v", err)
-	}
+    // Initialize engine
+    llmEngine, err := engine.NewLLMEngine(
+        modelPath,
+        config.WithEnforceEager(true),
+        config.WithTensorParallelSize(1),
+    )
+    if err != nil { log.Fatalf("Failed to initialize LLM engine: %v", err) }
 
 	// Set sampling parameters
     params := &sampling.SamplingParams{
@@ -60,6 +62,42 @@ func main() {
     }
 
     tok, _ := tokenizer.NewTokenizer(modelPath)
+    if *verify {
+        // Build model directly and print last-token top logits
+        cfg, err := config.LoadConfig(modelPath)
+        if err != nil { log.Fatalf("config: %v", err) }
+        mdl, err := models.NewQwen3Model(cfg)
+        if err != nil { log.Fatalf("model: %v", err) }
+        ids, err := tok.Encode(prompt)
+        if err != nil { log.Fatalf("encode: %v", err) }
+        // Prepare input tensors [T] and positions [T]
+        T := len(ids)
+        idT, _ := tensor.NewTensor([]int{T}, tensor.Int64, tensor.CPU)
+        posT, _ := tensor.NewTensor([]int{T}, tensor.Int64, tensor.CPU)
+        idBuf := idT.Data().Data().([]int64)
+        posBuf := posT.Data().Data().([]int64)
+        for i, v := range ids { idBuf[i] = int64(v); posBuf[i] = int64(i) }
+        logits, err := mdl.Forward(idT, posT)
+        if err != nil { log.Fatalf("forward: %v", err) }
+        shape := logits.Shape()
+        if len(shape) != 2 { log.Fatalf("unexpected logits shape: %v", shape) }
+        V := shape[1]
+        data := logits.Data().Data().([]float32)
+        last := data[(T-1)*V : T*V]
+        // find top-10
+        type kv struct{ id int; logit float32 }
+        top := make([]kv, V)
+        for i := 0; i < V; i++ { top[i] = kv{i, last[i]} }
+        sort.Slice(top, func(i,j int) bool { return top[i].logit > top[j].logit })
+        if len(top) > 10 { top = top[:10] }
+        fmt.Printf("Prompt: %s\n", prompt)
+        fmt.Println("Top logits (id, logit, token):")
+        for _, k := range top {
+            s, _ := tok.Decode([]int{k.id})
+            fmt.Printf("%d\t%.4f\t%s\n", k.id, k.logit, s)
+        }
+        return
+    }
     if *stream {
         // streaming: add request then step
         if err := llmEngine.AddRequest(prompt, params); err != nil { log.Fatalf("add request: %v", err) }

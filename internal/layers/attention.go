@@ -33,7 +33,7 @@ func (a *Attention) SetVWeights(w []float32) error { return a.vProj.LoadWeights(
 func (a *Attention) SetOWeights(w []float32) error { return a.oProj.LoadWeights(w, nil) }
 
 // NewAttention creates a new attention layer
-func NewAttention(hiddenSize, numHeads, numKVHeads, headDim int, maxPosition int, ropeTheta float64) (*Attention, error) {
+func NewAttention(hiddenSize, numHeads, numKVHeads, headDim int, maxPosition int, ropeTheta float64, ropeScalingType string, ropeScalingFactor float64) (*Attention, error) {
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
 
 	qProj, err := NewLinear(hiddenSize, numHeads*headDim, false)
@@ -56,7 +56,7 @@ func NewAttention(hiddenSize, numHeads, numKVHeads, headDim int, maxPosition int
 		return nil, fmt.Errorf("failed to create o projection: %v", err)
 	}
 
-    rotaryEmbed, err := NewRotaryEmbedding(headDim, headDim, maxPosition, ropeTheta)
+    rotaryEmbed, err := NewRotaryEmbedding(headDim, headDim, maxPosition, ropeTheta, ropeScalingType, ropeScalingFactor)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create rotary embedding: %v", err)
 	}

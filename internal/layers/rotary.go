@@ -9,25 +9,31 @@ import (
 
 // RotaryEmbedding represents rotary positional embedding
 type RotaryEmbedding struct {
-	headDim       int
-	rotaryDim     int
-	maxPosition   int
-	base          float64
-	cosCache      []float32
-	sinCache      []float32
+    headDim       int
+    rotaryDim     int
+    maxPosition   int
+    base          float64
+    cosCache      []float32
+    sinCache      []float32
+    scalingType   string
+    scalingFactor float64
 }
 
 // NewRotaryEmbedding creates a new rotary embedding
-func NewRotaryEmbedding(headDim, rotaryDim, maxPosition int, base float64) (*RotaryEmbedding, error) {
-	if rotaryDim > headDim {
-		return nil, fmt.Errorf("rotary dim cannot exceed head dim")
-	}
+func NewRotaryEmbedding(headDim, rotaryDim, maxPosition int, base float64, scalingType string, scalingFactor float64) (*RotaryEmbedding, error) {
+    if rotaryDim > headDim {
+        return nil, fmt.Errorf("rotary dim cannot exceed head dim")
+    }
 
-	// Precompute cos and sin values
-	invFreq := make([]float64, rotaryDim/2)
-	for i := 0; i < rotaryDim/2; i++ {
-		invFreq[i] = 1.0 / math.Pow(base, float64(i*2)/float64(rotaryDim))
-	}
+    // Precompute cos and sin values
+    effBase := base
+    if scalingType == "linear" && scalingFactor > 0 {
+        effBase = base * scalingFactor
+    }
+    invFreq := make([]float64, rotaryDim/2)
+    for i := 0; i < rotaryDim/2; i++ {
+        invFreq[i] = 1.0 / math.Pow(effBase, float64(i*2)/float64(rotaryDim))
+    }
 
 	cosCache := make([]float32, maxPosition*rotaryDim/2)
 	sinCache := make([]float32, maxPosition*rotaryDim/2)
@@ -40,14 +46,16 @@ func NewRotaryEmbedding(headDim, rotaryDim, maxPosition int, base float64) (*Rot
 		}
 	}
 
-	return &RotaryEmbedding{
-		headDim:     headDim,
-		rotaryDim:   rotaryDim,
-		maxPosition: maxPosition,
-		base:        base,
-		cosCache:    cosCache,
-		sinCache:    sinCache,
-	}, nil
+    return &RotaryEmbedding{
+        headDim:     headDim,
+        rotaryDim:   rotaryDim,
+        maxPosition: maxPosition,
+        base:        effBase,
+        cosCache:    cosCache,
+        sinCache:    sinCache,
+        scalingType: scalingType,
+        scalingFactor: scalingFactor,
+    }, nil
 }
 
 // Forward applies rotary embedding to query and key
@@ -105,17 +113,17 @@ func (r *RotaryEmbedding) Forward(positions, query, key *tensor.Tensor) (*tensor
 
 // applyRotary applies rotary embedding to a slice of data
 func (r *RotaryEmbedding) applyRotary(data []float32, pos int) {
-	for i := 0; i < r.rotaryDim/2; i++ {
-		idx1 := i * 2
-		idx2 := i * 2 + 1
-		
-		cos := r.cosCache[pos*r.rotaryDim/2+i]
-		sin := r.sinCache[pos*r.rotaryDim/2+i]
-		
-		x1 := data[idx1]
-		x2 := data[idx2]
-		
-		data[idx1] = x1*cos - x2*sin
-		data[idx2] = x2*cos + x1*sin
-	}
+    for i := 0; i < r.rotaryDim/2; i++ {
+        idx1 := i * 2
+        idx2 := i * 2 + 1
+        
+        cos := r.cosCache[pos*r.rotaryDim/2+i]
+        sin := r.sinCache[pos*r.rotaryDim/2+i]
+        
+        x1 := data[idx1]
+        x2 := data[idx2]
+        
+        data[idx1] = x1*cos - x2*sin
+        data[idx2] = x2*cos + x1*sin
+    }
 }
